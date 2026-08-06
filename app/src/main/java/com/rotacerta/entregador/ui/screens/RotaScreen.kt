@@ -1,0 +1,324 @@
+package com.rotacerta.entregador.ui.screens
+
+import android.Manifest
+import android.content.pm.PackageManager
+import androidx.compose.foundation.background
+import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Celebration
+import androidx.compose.material.icons.filled.Home
+import androidx.compose.material.icons.filled.Navigation
+import androidx.compose.material.icons.filled.QrCodeScanner
+import androidx.compose.material.icons.filled.Refresh
+import androidx.compose.material.icons.filled.SearchOff
+import androidx.compose.material3.*
+import androidx.compose.runtime.*
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import androidx.core.content.ContextCompat
+import androidx.core.net.toUri
+import com.rotacerta.entregador.data.DeliveryStatus
+import com.rotacerta.entregador.data.NavApp
+import com.rotacerta.entregador.domain.RouteOptimizer
+import com.rotacerta.entregador.ui.components.DeliveryCard
+import com.rotacerta.entregador.ui.components.StatsStrip
+import com.rotacerta.entregador.ui.theme.Accent
+import com.rotacerta.entregador.ui.theme.AccentInk
+import com.rotacerta.entregador.ui.theme.Muted
+import com.rotacerta.entregador.viewmodel.RotaViewModel
+import com.rotacerta.entregador.viewmodel.ScanLabelResult
+
+@Composable
+fun RotaScreen(viewModel: RotaViewModel) {
+    val deliveries by viewModel.deliveries.collectAsState()
+    val config by viewModel.config.collectAsState()
+    val context = LocalContext.current
+
+    // Controla a abertura do scanner de pedido (novo) e do scanner de rastreio (verificar)
+    var showScanPedido by remember { mutableStateOf(false) }
+    var showPackageScanner by remember { mutableStateOf(false) }
+    val scanResult by viewModel.scanLabelResult.collectAsState()
+
+    // Inicia o serviço de monitoramento de chegada em segundo plano
+    LaunchedEffect(Unit) {
+        val hasPermission = ContextCompat.checkSelfPermission(
+            context, Manifest.permission.ACCESS_FINE_LOCATION
+        ) == PackageManager.PERMISSION_GRANTED
+        if (hasPermission) {
+            val intent = android.content.Intent(context, com.rotacerta.entregador.service.ArrivalMonitorService::class.java)
+            ContextCompat.startForegroundService(context, intent)
+        }
+    }
+
+    // ─── Dialogs ──────────────────────────────────────────────────────────────
+
+    if (showScanPedido) {
+        ScanPedidoDialog(
+            viewModel = viewModel,
+            onDismiss = { showScanPedido = false }
+        )
+    }
+
+    if (showPackageScanner) {
+        TrackingScannerDialog(
+            onResult = { code -> showPackageScanner = false; viewModel.scanPackageByTrackingCode(code) },
+            onDismiss = { showPackageScanner = false }
+        )
+    }
+
+    scanResult?.let { result ->
+        ScanResultDialog(result, onDismiss = { viewModel.clearScanLabelResult() })
+    }
+
+    // ─── Listas ───────────────────────────────────────────────────────────────
+
+    val pending = remember(deliveries) {
+        deliveries.filter { it.status == DeliveryStatus.PENDENTE }.sortedBy { it.order }
+    }
+    val done = remember(deliveries) {
+        deliveries.filter { it.status == DeliveryStatus.ENTREGUE }
+    }
+
+    var routeCompleteDismissed by remember { mutableStateOf(false) }
+    LaunchedEffect(pending.isEmpty(), done.isNotEmpty()) {
+        if (pending.isNotEmpty()) routeCompleteDismissed = false
+    }
+    if (pending.isEmpty() && done.isNotEmpty() && config.roundTrip && !routeCompleteDismissed) {
+        val homeAddress = config.homeAddress.ifBlank { config.originAddress }
+        RouteCompleteDialog(
+            homeAddress = homeAddress,
+            onNavigate = {
+                val enc = java.net.URLEncoder.encode(homeAddress, "UTF-8")
+                val url = if (config.navApp == NavApp.WAZE)
+                    "https://waze.com/ul?q=$enc&navigate=yes"
+                else
+                    "https://www.google.com/maps/dir/?api=1&destination=$enc&travelmode=driving"
+                context.startActivity(android.content.Intent(android.content.Intent.ACTION_VIEW, url.toUri()))
+            },
+            onDismiss = { routeCompleteDismissed = true }
+        )
+    }
+
+    val gruposPorParada = remember(pending) {
+        val result = mutableListOf<Pair<Int, List<com.rotacerta.entregador.data.Delivery>>>()
+        var currentOrder: Int? = null
+        var bucket = mutableListOf<com.rotacerta.entregador.data.Delivery>()
+        pending.forEach { d ->
+            if (d.order != currentOrder) {
+                if (bucket.isNotEmpty()) result.add(currentOrder!! to bucket)
+                bucket = mutableListOf()
+                currentOrder = d.order
+            }
+            bucket.add(d)
+        }
+        if (bucket.isNotEmpty()) result.add(currentOrder!! to bucket)
+        result
+    }
+
+    val stats = viewModel.routeStats()
+
+    // ─── UI ───────────────────────────────────────────────────────────────────
+
+    Column(Modifier.fillMaxSize().padding(16.dp)) {
+        StatsStrip(stats.pendingCount, stats.distanceKm, stats.etaMillis)
+
+        Spacer(Modifier.height(14.dp))
+
+        // Botão principal: ESCANEAR PEDIDO (destaque, primário)
+        Button(
+            onClick = { showScanPedido = true },
+            modifier = Modifier.fillMaxWidth().height(54.dp),
+            shape = RoundedCornerShape(14.dp),
+            elevation = ButtonDefaults.buttonElevation(defaultElevation = 3.dp)
+        ) {
+            Icon(Icons.Default.QrCodeScanner, contentDescription = null, modifier = Modifier.size(20.dp))
+            Spacer(Modifier.width(8.dp))
+            Text("Escanear pedido", fontWeight = FontWeight.Bold, fontSize = 16.sp)
+        }
+
+        Spacer(Modifier.height(8.dp))
+
+        // Botão secundário: Otimizar rota
+        OutlinedButton(
+            onClick = { viewModel.optimizeRoute() },
+            modifier = Modifier.fillMaxWidth().height(46.dp),
+            shape = RoundedCornerShape(14.dp)
+        ) {
+            Icon(Icons.Default.Refresh, contentDescription = null, modifier = Modifier.size(16.dp))
+            Spacer(Modifier.width(6.dp))
+            Text("Otimizar rota", fontWeight = FontWeight.SemiBold)
+        }
+
+        if (deliveries.isEmpty()) {
+            Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                Column(horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Icon(Icons.Default.QrCodeScanner, contentDescription = null, tint = Muted, modifier = Modifier.size(48.dp))
+                    Text(
+                        "Escaneie a etiqueta de um pedido\npara começar a rota.",
+                        color = Muted,
+                        textAlign = TextAlign.Center,
+                        lineHeight = 20.sp
+                    )
+                }
+            }
+        } else {
+            LazyColumn(
+                Modifier.fillMaxSize().padding(top = 12.dp),
+                verticalArrangement = Arrangement.spacedBy(10.dp)
+            ) {
+                if (pending.isNotEmpty()) {
+                    item { SectionLabel("Pendentes (${pending.size})") }
+                    gruposPorParada.forEach { (stopOrder, itemsNaParada) ->
+                        if (itemsNaParada.size > 1) {
+                            item(key = "stop-$stopOrder") { StopGroupLabel(stopOrder, itemsNaParada.size) }
+                        }
+                        items(itemsNaParada, key = { it.id }) { d ->
+                            DeliveryCard(
+                                delivery = d,
+                                onDelivered = { viewModel.markDelivered(d) },
+                                onRemove = { viewModel.removeDelivery(d) },
+                                onNavigate = {
+                                    val enc = java.net.URLEncoder.encode(d.address, "UTF-8")
+                                    val url = if (config.navApp == NavApp.WAZE)
+                                        "https://waze.com/ul?q=$enc&navigate=yes"
+                                    else
+                                        "https://www.google.com/maps/dir/?api=1&destination=$enc&travelmode=driving"
+                                    context.startActivity(android.content.Intent(android.content.Intent.ACTION_VIEW, url.toUri()))
+                                }
+                            )
+                        }
+                    }
+                }
+                if (done.isNotEmpty()) {
+                    item { SectionLabel("Entregues (${done.size})") }
+                    items(done, key = { it.id }) { d ->
+                        DeliveryCard(delivery = d, onDelivered = {}, onRemove = { viewModel.removeDelivery(d) }, onNavigate = {})
+                    }
+                }
+                item { Spacer(Modifier.height(80.dp)) }
+            }
+        }
+    }
+}
+
+// ─── Componentes internos ─────────────────────────────────────────────────────
+
+@Composable
+private fun StopGroupLabel(stopOrder: Int, count: Int) {
+    Row(
+        Modifier.fillMaxWidth().padding(top = 4.dp, bottom = 2.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(6.dp)
+    ) {
+        Text("📍 Parada $stopOrder", color = Accent, style = MaterialTheme.typography.labelMedium, fontWeight = FontWeight.Bold)
+        Text("· $count pacotes neste endereço", color = Muted, style = MaterialTheme.typography.labelMedium)
+    }
+}
+
+@Composable
+private fun SectionLabel(text: String) {
+    Text(
+        text.uppercase(), color = Muted,
+        style = MaterialTheme.typography.labelMedium,
+        modifier = Modifier.padding(bottom = 4.dp)
+    )
+}
+
+@Composable
+private fun ScanResultDialog(result: ScanLabelResult, onDismiss: () -> Unit) {
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        confirmButton = {
+            Button(onClick = onDismiss, modifier = Modifier.fillMaxWidth()) { Text("Entendi") }
+        },
+        text = {
+            Column(
+                Modifier.fillMaxWidth().padding(vertical = 8.dp),
+                horizontalAlignment = Alignment.CenterHorizontally
+            ) {
+                when (result) {
+                    is ScanLabelResult.Found -> {
+                        Box(
+                            Modifier.size(120.dp).clip(CircleShape).background(Accent),
+                            contentAlignment = Alignment.Center
+                        ) {
+                            Text("${result.position}", fontSize = 56.sp, fontWeight = FontWeight.Bold, color = AccentInk)
+                        }
+                        Spacer(Modifier.height(12.dp))
+                        Text("${result.position}/${result.total}", fontSize = 22.sp, fontWeight = FontWeight.Bold, color = Accent)
+                        Spacer(Modifier.height(4.dp))
+                        Text("Parada ${result.position} de ${result.total}", fontSize = 15.sp, color = Muted, textAlign = TextAlign.Center)
+                        Spacer(Modifier.height(8.dp))
+                        Text(result.address, fontSize = 15.sp, fontWeight = FontWeight.SemiBold, textAlign = TextAlign.Center, modifier = Modifier.padding(horizontal = 8.dp))
+                        if (result.ambiguous) {
+                            Spacer(Modifier.height(12.dp))
+                            Text("📦 Essa parada tem mais de um pacote — confira se pegou todos antes de seguir.", fontSize = 13.sp, color = Muted, textAlign = TextAlign.Center)
+                        }
+                    }
+                    is ScanLabelResult.NotFound -> {
+                        Icon(Icons.Default.SearchOff, contentDescription = null, modifier = Modifier.size(64.dp), tint = Muted)
+                        Spacer(Modifier.height(16.dp))
+                        Text("Nenhum pacote com esse código nesta rota", fontSize = 18.sp, fontWeight = FontWeight.SemiBold, textAlign = TextAlign.Center)
+                        Spacer(Modifier.height(6.dp))
+                        Text("Código lido: ${result.code}", fontSize = 13.sp, color = Muted, textAlign = TextAlign.Center)
+                    }
+                }
+            }
+        }
+    )
+}
+
+@Composable
+private fun RouteCompleteDialog(homeAddress: String, onNavigate: () -> Unit, onDismiss: () -> Unit) {
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        confirmButton = {
+            Button(
+                onClick = { onNavigate(); onDismiss() },
+                modifier = Modifier.fillMaxWidth(),
+                enabled = homeAddress.isNotBlank()
+            ) {
+                Icon(Icons.Default.Navigation, contentDescription = null, modifier = Modifier.size(16.dp))
+                Spacer(Modifier.width(6.dp))
+                Text("Navegar até o destino final")
+            }
+        },
+        dismissButton = { TextButton(onClick = onDismiss) { Text("Fechar") } },
+        text = {
+            Column(Modifier.fillMaxWidth().padding(vertical = 8.dp), horizontalAlignment = Alignment.CenterHorizontally) {
+                Box(Modifier.size(84.dp).clip(CircleShape).background(Accent), contentAlignment = Alignment.Center) {
+                    Icon(Icons.Default.Celebration, contentDescription = null, tint = AccentInk, modifier = Modifier.size(42.dp))
+                }
+                Spacer(Modifier.height(14.dp))
+                Text("Rota completa! 🎉", fontSize = 22.sp, fontWeight = FontWeight.Bold, textAlign = TextAlign.Center)
+                Spacer(Modifier.height(6.dp))
+                Text("Todas as entregas foram concluídas.", fontSize = 14.sp, color = Muted, textAlign = TextAlign.Center)
+                if (homeAddress.isNotBlank()) {
+                    Spacer(Modifier.height(18.dp))
+                    Row(
+                        Modifier.fillMaxWidth().clip(RoundedCornerShape(12.dp))
+                            .background(com.rotacerta.entregador.ui.theme.Surface2).padding(14.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Icon(Icons.Default.Home, contentDescription = null, tint = Accent, modifier = Modifier.size(20.dp))
+                        Spacer(Modifier.width(10.dp))
+                        Column {
+                            Text("Agora é ida e volta pra:", fontSize = 11.sp, color = Muted)
+                            Text(homeAddress, fontSize = 13.5.sp, fontWeight = FontWeight.SemiBold)
+                        }
+                    }
+                }
+            }
+        }
+    )
+}
