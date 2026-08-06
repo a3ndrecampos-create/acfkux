@@ -89,7 +89,7 @@ private fun SplashScreen(onFinish: () -> Unit) {
             Image(
                 painter = painterResource(id = R.drawable.logo_arkacortex),
                 contentDescription = "Arka Cortex",
-                modifier = Modifier.width(140.dp)
+                modifier = Modifier.width(200.dp)
             )
         }
     }
